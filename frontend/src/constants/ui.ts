@@ -2,6 +2,7 @@ export const NAV_ITEMS = [
   { to: '/jobs', label: '线路图', sub: '作业 / 依赖', permission: 'dag:validate' },
   { to: '/simulate', label: '模拟运行', sub: '关键路径', permission: 'run:simulate' },
   { to: '/sla', label: '回填窗口', sub: 'SLA', permission: 'backfill:read' },
+  { to: '/dep-check', label: '依赖体检', sub: '证据 / 补边', permission: 'check:read' },
   { to: '/watch', label: '值班台', sub: '等待 / 告警', permission: 'estimate:read' },
 ];
 

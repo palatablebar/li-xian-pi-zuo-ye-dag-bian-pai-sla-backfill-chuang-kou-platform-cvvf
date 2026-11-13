@@ -1,5 +1,6 @@
 import { Navigate, Route, Routes } from 'react-router-dom';
 import AppShell from '../components/layout/AppShell';
+import DepCheck from '../pages/DepCheck';
 import Jobs from '../pages/Jobs';
 import Login from '../pages/Login';
 import Simulate from '../pages/Simulate';
@@ -43,6 +44,14 @@ export default function AppRouter() {
         element={
           <Protected permission="backfill:read">
             <Sla />
+          </Protected>
+        }
+      />
+      <Route
+        path="/dep-check"
+        element={
+          <Protected permission="check:read">
+            <DepCheck />
           </Protected>
         }
       />

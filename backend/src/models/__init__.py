@@ -13,6 +13,8 @@ from src.models.dependency import Dependency  # noqa: E402
 from src.models.pipeline_run import PipelineRun  # noqa: E402
 from src.models.sla_policy import SlaPolicy  # noqa: E402
 from src.models.audit import AuditLog  # noqa: E402
+from src.models.job_run_record import JobRunRecord  # noqa: E402
+from src.models.dep_check import DepCheckBatch, DepCheckItem  # noqa: E402
 
 __all__ = [
     "Base",
@@ -23,4 +25,7 @@ __all__ = [
     "PipelineRun",
     "SlaPolicy",
     "AuditLog",
+    "JobRunRecord",
+    "DepCheckBatch",
+    "DepCheckItem",
 ]

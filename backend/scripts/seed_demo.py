@@ -1,4 +1,5 @@
-"""幂等 seed：3 账号 / 4 链路 / 24 作业 / 38 依赖 / 120 条历史运行 / 3 条 SLA。
+"""幂等 seed：3 账号 / 4 链路 / 24 作业 / 38 依赖 / 120 条历史运行 / 3 条 SLA /
+30 天 × 24 作业的原始调度记录（含重试、迟到、旧版本剧本）。
 
 自然键 upsert：
   users.email
@@ -7,6 +8,7 @@
   dependencies(pipeline_id, upstream_job_id, downstream_job_id)
   sla_policies.pipeline_id
   pipeline_runs.seed_key = "seed:history:<pipeline>:<date>"
+  job_run_records.seed_key = "seed:runrec:<job>:<date>:a<attempt>:v<version>"
 
 重复执行不新增、不覆盖用户改过的数据（只在缺失时插入）。
 历史运行总时长 = 链路 P50 与 P90 的 40% 分位差 + 按 (链路, 第几天) 查表的抖动，
@@ -23,6 +25,7 @@ from src.constants.enums import DependencyType, JobStatus, RunMode, RunStatus
 from src.models.audit import AuditLog
 from src.models.dependency import Dependency
 from src.models.job import Job
+from src.models.job_run_record import JobRunRecord
 from src.models.pipeline import Pipeline
 from src.models.pipeline_run import PipelineRun
 from src.models.sla_policy import SlaPolicy
@@ -41,6 +44,7 @@ from scripts.demo_config import (
     HISTORY_LATE_DAYS,
     JOB_SPECS,
     PIPELINES,
+    RECORD_PLAYS,
     SLA_POLICIES,
 )
 
@@ -268,6 +272,165 @@ def _run_created_at(run_date: date, start_clock: str, total_minutes: int) -> dat
     return datetime.combine(run_date, time(hour, minute)) + timedelta(minutes=int(total_minutes))
 
 
+# ---------------------------------------------------------------- 原始调度记录（依赖体检用）
+#
+# 剧本 kind 说明（参数见 demo_config.RECORD_PLAYS）：
+#   early_start        提前到「起跑 + start_minute」开跑，时长不变（制造抢跑）
+#   retry              attempt1 跑 first_minutes 失败，attempt2 完整成功
+#   reversion          同一 attempt 先报 v1（结束时间偏移），再报 v2（正确时间）
+#   late_ingest        记录正常，但入库时间晚 hours 小时（迟到记录）
+#   inverted           结束时间早于开始时间（时间倒挂，证据冲突）
+#   conflicting_final  同 attempt 同 version 上报两条时间不同的记录（证据冲突）
+#   missing_after      只有最近 max_day_index 天有记录（新作业，样本不足）
+#   follow_job         稳定跟在 follow 作业结束后 gap_base + day%gap_mod 分钟起跑；
+#                      每 except_mod 天（except_hits）例外，提前到 except_start_minute
+
+
+def _day_record_tuples(
+    spec,
+    job_code: str,
+    day_index: int,
+    base_start: int,
+    base_end: int,
+    jitter: int,
+    follow_end: int | None,
+) -> list[tuple[int, int, str, int, int, int]]:
+    """返回 [(attempt, version, status, start_min, end_min, ingested_min)]，分钟相对业务日期 00:00。"""
+    duration = base_end - base_start
+    start_minute = clock_to_minutes(spec.start_clock)
+    normal = [(1, 1, "success", base_start, base_end, base_end + 5)]
+    for play in RECORD_PLAYS:
+        if play.pipeline != spec.code or play.job != job_code:
+            continue
+        if day_index % play.mod not in play.hits:
+            continue
+        params = play.params or {}
+        if play.kind == "missing_after":
+            if day_index > int(params["max_day_index"]):
+                return []
+        elif play.kind == "early_start":
+            start = start_minute + int(params["start_minute"]) + jitter
+            return [(1, 1, "success", start, start + duration, start + duration + 5)]
+        elif play.kind == "retry":
+            first_end = base_start + int(params["first_minutes"])
+            retry_start = base_start + int(params["retry_gap_minutes"])
+            retry_end = retry_start + duration
+            return [
+                (1, 1, "failed", base_start, first_end, first_end + 5),
+                (2, 1, "success", retry_start, retry_end, retry_end + 5),
+            ]
+        elif play.kind == "reversion":
+            v1_end = base_end + int(params["v1_end_shift_minutes"])
+            return [
+                (1, 1, "success", base_start, v1_end, v1_end + 5),
+                (1, 2, "success", base_start, base_end, base_end + int(params["v2_ingest_lag_minutes"])),
+            ]
+        elif play.kind == "late_ingest":
+            return [(1, 1, "success", base_start, base_end, base_end + int(params["hours"]) * 60)]
+        elif play.kind == "inverted":
+            return [(1, 1, "success", base_start, base_start - int(params["minutes"]), base_start + 5)]
+        elif play.kind == "conflicting_final":
+            shift = int(params["shift_minutes"])
+            return [
+                (1, 1, "success", base_start, base_end, base_end + 5),
+                (1, 1, "success", base_start + shift, base_end + shift, base_end + shift + 5),
+            ]
+        elif play.kind == "follow_job":
+            if day_index % int(params["except_mod"]) in tuple(params["except_hits"]):
+                start = start_minute + int(params["except_start_minute"]) + jitter
+            else:
+                anchor_end = follow_end if follow_end is not None else base_end
+                start = anchor_end + int(params["gap_base"]) + (day_index % int(params["gap_mod"]))
+            return [(1, 1, "success", start, start + duration, start + duration + 5)]
+    return normal
+
+
+def ensure_job_run_records(db, pipelines: dict[str, Pipeline], jobs_by_code: dict[str, Job]) -> int:
+    """按剧本生成 30 天 × 24 作业的原始调度记录（重试/迟到/旧版本混在一起）。"""
+    anchor = date.fromisoformat(HISTORY_ANCHOR)
+    created = 0
+    for spec in PIPELINES:
+        pipeline = pipelines[spec.code]
+        job_rows = [
+            {
+                "id": jobs_by_code[item.code].id,
+                "code": item.code,
+                "name": item.name,
+                "pipeline_code": spec.code,
+                "layer": item.layer,
+                "owner": item.owner,
+                "status": JobStatus.ACTIVE.value,
+                "p50_seconds": item.p50_minutes * 60,
+                "p90_seconds": item.p90_minutes * 60,
+            }
+            for item in JOB_SPECS
+            if item.pipeline == spec.code
+        ]
+        code_to_id = {row["code"]: row["id"] for row in job_rows}
+        edge_rows = [
+            {
+                "id": index + 1,
+                "upstream_id": code_to_id[edge.upstream],
+                "downstream_id": code_to_id[edge.downstream],
+                "upstream_code": edge.upstream,
+                "downstream_code": edge.downstream,
+                "dep_type": edge.dep_type,
+                "lag_minutes": edge.lag_minutes,
+            }
+            for index, edge in enumerate(e for e in DEPENDENCIES if e.pipeline == spec.code)
+        ]
+        p50_schedule = dag_service.compute_schedule(job_rows, edge_rows, RunMode.P50.value)
+        es_ef = {row["code"]: (row["es_minutes"], row["ef_minutes"]) for row in p50_schedule["jobs"]}
+        start_minute = clock_to_minutes(spec.start_clock)
+
+        for day_index in range(HISTORY_DAYS):
+            run_date = anchor - timedelta(days=day_index)
+            jitter = ((day_index * 7) % 5) - 2  # 整链路同向平移，不改变作业间相对关系
+            base = {
+                code: (start_minute + es + jitter, start_minute + ef + jitter)
+                for code, (es, ef) in es_ef.items()
+            }
+            for item in [row for row in JOB_SPECS if row.pipeline == spec.code]:
+                base_start, base_end = base[item.code]
+                follow_end = None
+                for play in RECORD_PLAYS:
+                    if play.pipeline == spec.code and play.job == item.code and play.kind == "follow_job":
+                        follow_code = (play.params or {}).get("follow")
+                        if follow_code in base:
+                            follow_end = base[follow_code][1]
+                tuples = _day_record_tuples(
+                    spec, item.code, day_index, base_start, base_end, jitter, follow_end
+                )
+                day_start = datetime.combine(run_date, time(0, 0))
+                seen_keys: dict[tuple[int, int], int] = {}
+                for attempt, version, status, s_min, e_min, i_min in tuples:
+                    # 同 (attempt, version) 的重复上报（conflicting_final 剧本）加序号后缀
+                    dup_index = seen_keys.get((attempt, version), 0)
+                    seen_keys[(attempt, version)] = dup_index + 1
+                    suffix = f":r{dup_index + 1}" if dup_index else ""
+                    seed_key = f"seed:runrec:{item.code}:{run_date.isoformat()}:a{attempt}:v{version}{suffix}"
+                    if db.scalar(select(JobRunRecord).where(JobRunRecord.seed_key == seed_key)):
+                        continue
+                    db.add(
+                        JobRunRecord(
+                            pipeline_id=pipeline.id,
+                            job_id=jobs_by_code[item.code].id,
+                            biz_date=run_date,
+                            attempt=attempt,
+                            record_version=version,
+                            status=status,
+                            start_at=day_start + timedelta(minutes=s_min),
+                            end_at=day_start + timedelta(minutes=e_min),
+                            ingested_at=day_start + timedelta(minutes=i_min),
+                            source="crontab",
+                            seed_key=seed_key,
+                        )
+                    )
+                    created += 1
+    db.flush()
+    return created
+
+
 def ensure_seed_audit(db) -> None:
     for seed_key, email, role, action, entity, entity_id, detail in SEED_AUDIT:
         if db.scalar(select(AuditLog).where(AuditLog.seed_key == seed_key)):
@@ -296,6 +459,7 @@ def seed_all() -> str:
         ensure_dependencies(db, pipelines, jobs)
         ensure_sla(db, pipelines)
         ensure_history_runs(db, pipelines, jobs)
+        ensure_job_run_records(db, pipelines, jobs)
         ensure_seed_audit(db)
 
         job_count = db.scalar(select(func.count()).select_from(Job)) or 0
@@ -307,12 +471,13 @@ def seed_all() -> str:
             )
             or 0
         )
+        record_count = db.scalar(select(func.count()).select_from(JobRunRecord)) or 0
         sla_count = db.scalar(select(func.count()).select_from(SlaPolicy)) or 0
         user_count = db.scalar(select(func.count()).select_from(User)) or 0
 
     summary = (
         f"SEED_SUMMARY brand=dagpilot jobs={job_count} deps={dep_count} pipelines={pipeline_count} "
-        f"runs={run_count} slas={sla_count} users={user_count}"
+        f"runs={run_count} records={record_count} slas={sla_count} users={user_count}"
     )
     print(summary, flush=True)
     return summary

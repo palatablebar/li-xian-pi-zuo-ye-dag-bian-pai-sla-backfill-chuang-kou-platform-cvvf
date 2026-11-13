@@ -379,3 +379,137 @@ export interface WatchPayload {
     unacked: number;
   };
 }
+
+export type CheckVerdictType = 'effective' | 'violated' | 'insufficient' | 'pending' | 'suggested';
+
+export interface DepCheckBatch {
+  id: number;
+  batch_no: string;
+  scope: string;
+  status: 'draft' | 'published' | 'superseded' | 'stale';
+  status_label: string;
+  version: number;
+  input_fingerprint: string;
+  is_stale: boolean;
+  item_count: number;
+  stats: Record<string, number>;
+  note: string;
+  created_by: string;
+  created_at: string | null;
+  published_by: string | null;
+  published_at: string | null;
+}
+
+export interface DepCheckEvidencePair {
+  biz_date: string;
+  up_end: string;
+  down_start: string;
+  gap_minutes: number;
+  required_lag_minutes?: number;
+  obey?: boolean;
+  adjacent?: boolean;
+}
+
+export interface DepCheckCounterexample {
+  biz_date: string;
+  gap_minutes: number;
+  reason: 'order_reversed' | 'gap_too_large';
+  detail: string;
+}
+
+export interface DepCheckItem {
+  id: number;
+  item_kind: 'edge' | 'candidate';
+  pipeline_code: string;
+  upstream_code: string;
+  upstream_name: string;
+  downstream_code: string;
+  downstream_name: string;
+  dep_type: string | null;
+  dep_type_label: string;
+  lag_minutes: number;
+  verdict: CheckVerdictType;
+  verdict_label: string;
+  sample_days: number;
+  support_days: number;
+  reason: string;
+  evidence: DepCheckEvidencePair[];
+  counterexamples: DepCheckCounterexample[];
+}
+
+export interface DepCheckRunResult {
+  batch: DepCheckBatch;
+  reused: boolean;
+  message: string;
+}
+
+export interface DepCheckBatchList {
+  items: DepCheckBatch[];
+  current_fingerprint: string;
+}
+
+export interface DepCheckDetail {
+  batch: DepCheckBatch;
+  items: DepCheckItem[];
+  verdict_labels: Record<string, string>;
+  reject_reason_labels: Record<string, string>;
+}
+
+export interface DepCheckCurrent {
+  has_current: boolean;
+  batch: DepCheckBatch | null;
+  items: DepCheckItem[];
+  current_fingerprint: string;
+}
+
+export interface RunFactRow {
+  job_id: number;
+  job_code: string;
+  job_name: string;
+  biz_date: string;
+  attempt: number;
+  status: string;
+  start_at: string;
+  end_at: string;
+  ingested_at: string;
+  is_late_record: boolean;
+  ingest_lag_minutes: number;
+}
+
+export interface RunFactRejectedRow {
+  record_id: number;
+  job_code: string;
+  job_name: string;
+  biz_date: string;
+  attempt: number;
+  record_version: number;
+  status: string;
+  start_at: string | null;
+  end_at: string | null;
+  ingested_at: string | null;
+  reject_reason: string;
+  reject_detail: string;
+}
+
+export interface RunFactConflict {
+  job_code: string;
+  job_name: string;
+  biz_date: string;
+  reason: string;
+  detail: Record<string, unknown>;
+}
+
+export interface RunFactsPayload {
+  pipeline_code: string;
+  pipeline_name: string;
+  biz_date: string | null;
+  facts: RunFactRow[];
+  rejected: RunFactRejectedRow[];
+  conflicts: RunFactConflict[];
+  summary: {
+    raw_records: number;
+    fact_days: number;
+    rejected: number;
+    conflict_days: number;
+  };
+}

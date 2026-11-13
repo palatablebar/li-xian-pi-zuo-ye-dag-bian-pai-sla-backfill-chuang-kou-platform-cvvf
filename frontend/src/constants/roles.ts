@@ -19,9 +19,21 @@ export const PERMISSIONS: Record<Role, string[]> = {
     'export:read',
     'audit:read',
     'estimate:read',
+    'check:read',
+    'check:run',
+    'check:publish',
   ],
-  operator: ['dag:validate', 'run:simulate', 'backfill:read', 'alert:ack', 'export:read', 'estimate:read'],
-  viewer: ['estimate:read'],
+  operator: [
+    'dag:validate',
+    'run:simulate',
+    'backfill:read',
+    'alert:ack',
+    'export:read',
+    'estimate:read',
+    'check:read',
+    'check:run',
+  ],
+  viewer: ['estimate:read', 'check:read'],
 };
 
 export function can(role: Role | undefined, permission: string): boolean {

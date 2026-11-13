@@ -14,5 +14,8 @@ ERROR_CODES: dict[str, str] = {
     "DAG_SELF_LOOP": "作业不能依赖自身",
     "DAG_EMPTY": "该链路没有作业，无法计算",
     "NO_SLA": "该链路没有生效的 SLA 策略",
+    "BATCH_NOT_DRAFT": "只有草稿状态的体检批次才能发布",
+    "BATCH_STALE": "上游记录已变化，该批次结论失效，请重新发起检查",
+    "PUBLISH_FAILED": "发布失败，已保留旧版结论",
     "INTERNAL": "服务内部错误",
 }

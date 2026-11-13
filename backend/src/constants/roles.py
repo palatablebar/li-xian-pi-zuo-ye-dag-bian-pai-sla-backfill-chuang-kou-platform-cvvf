@@ -14,12 +14,14 @@ PERMISSIONS: dict[str, set[str]] = {
         "job:write", "dep:write", "dag:validate", "run:simulate",
         "sla:write", "backfill:read", "alert:ack", "export:read", "audit:read",
         "estimate:read",
+        "check:read", "check:run", "check:publish",
     },
     Role.OPERATOR.value: {
         "dag:validate", "run:simulate", "backfill:read",
         "alert:ack", "export:read", "estimate:read",
+        "check:read", "check:run",
     },
-    Role.VIEWER.value: {"estimate:read"},
+    Role.VIEWER.value: {"estimate:read", "check:read"},
 }
 
 # route/controller 层使用的角色白名单
@@ -33,6 +35,8 @@ ACK_ROLES = (Role.ADMIN.value, Role.OPERATOR.value)
 EXPORT_ROLES = (Role.ADMIN.value, Role.OPERATOR.value)
 AUDIT_ROLES = (Role.ADMIN.value,)
 READ_ROLES = (Role.ADMIN.value, Role.OPERATOR.value, Role.VIEWER.value)
+CHECK_RUN_ROLES = (Role.ADMIN.value, Role.OPERATOR.value)
+CHECK_PUBLISH_ROLES = (Role.ADMIN.value,)
 
 
 def has_permission(role: str, permission: str) -> bool:

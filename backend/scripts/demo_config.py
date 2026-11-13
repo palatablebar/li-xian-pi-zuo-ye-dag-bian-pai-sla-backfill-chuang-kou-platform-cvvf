@@ -182,3 +182,52 @@ HISTORY_JITTER = {
     "dim": [-3, 5, 0, 2, -6, 4, 1],
     "ml": [2, -4, 5, 0, 3],
 }
+
+
+# ---------------------------------------------------------------- 依赖体检剧本
+# 原始调度记录（job_run_records）按剧本生成：30 天历史里混进重试 / 迟到上报 /
+# 旧版本重发 / 时间冲突，并保证体检产出 有效 / 长期违背 / 证据不足 / 待核 /
+# 补边候选 全部情形。全部按 day_index（锚定日往前第几天，0=最近）取模命中，
+# 确定性可复现，两次 seed 结果逐字一致。
+
+
+@dataclass(frozen=True)
+class RecordPlay:
+    pipeline: str
+    job: str
+    kind: str                 # 见 seed_demo._apply_play 的说明
+    mod: int = 1              # day_index % mod
+    hits: tuple[int, ...] = (0,)  # 命中的余数集合
+    params: dict = None       # 剧本参数（按 kind 解释）
+
+
+RECORD_PLAYS: list[RecordPlay] = [
+    # L3 报表线：ads_store_daily 七成天数 01:25 抢跑（stage 01:34 才结束）
+    # → stage→store_daily 长期违背
+    RecordPlay("report", "ads_store_daily", "early_start", 10, (0, 1, 2, 3, 4, 6, 8),
+               {"start_minute": 25}),
+    # L4 特征线：feature_publish_hive 三成天数提前 5 分钟抢跑
+    # → label_join→publish_hive 遵守 70%，落在「证据不足」区间
+    RecordPlay("ml", "feature_publish_hive", "early_start", 10, (1, 4, 7),
+               {"start_minute": 59}),
+    # L4 新作业 feature_store_profile 只有最近 3 天记录 → 相关边样本不足待核
+    RecordPlay("ml", "feature_store_profile", "missing_after", 1, (0,),
+               {"max_day_index": 2}),
+    # L2 dim_channel_map 8 天时间倒挂 + 1 天同版本冲突上报
+    # → 相关 3 条边冲突占比 30%，待核
+    RecordPlay("dim", "dim_channel_map", "inverted", 4, (1,), {"minutes": 12}),
+    RecordPlay("dim", "dim_channel_map", "conflicting_final", 30, (3,), {"shift_minutes": 40}),
+    # L2 dim_wide_publish 每 5 天重试一次：attempt1 失败中断，attempt2 成功
+    RecordPlay("dim", "dim_wide_publish", "retry", 5, (1,),
+               {"first_minutes": 10, "retry_gap_minutes": 15}),
+    # L2 dim_member_scd 每 5 天重发一次修正版：v1 作废，v2 有效
+    RecordPlay("dim", "dim_member_scd", "reversion", 5, (2,),
+               {"v1_end_shift_minutes": -10, "v2_ingest_lag_minutes": 20}),
+    # L4 feature_member_rfm 每 6 天迟到上报 8 小时（记录仍有效，但要点名）
+    RecordPlay("ml", "feature_member_rfm", "late_ingest", 6, (2,), {"hours": 8}),
+    # L1 dqc_trade_rules 稳定等 dws_trade_minute 结束后 3~5 分钟起跑（无声明路径）
+    # → 补边候选；每 6 天有 1 天 02:10 自己抢跑（反例）
+    RecordPlay("ingest", "dqc_trade_rules", "follow_job", 1, (0,),
+               {"follow": "dws_trade_minute", "gap_base": 3, "gap_mod": 3,
+                "except_mod": 6, "except_hits": (2,), "except_start_minute": 70}),
+]

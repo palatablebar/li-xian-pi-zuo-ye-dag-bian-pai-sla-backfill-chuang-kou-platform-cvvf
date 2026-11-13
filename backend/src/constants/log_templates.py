@@ -15,4 +15,6 @@ ACTIONS: dict[str, str] = {
     "alert.ack": "确认告警",
     "export.schedule": "导出排期",
     "export.backfill": "导出回填计划",
+    "check.run": "发起依赖体检",
+    "check.publish": "发布体检结论",
 }

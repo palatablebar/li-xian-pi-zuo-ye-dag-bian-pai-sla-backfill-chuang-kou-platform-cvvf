@@ -23,13 +23,13 @@
 
 | 角色 | 邮箱 | 主要页面 | 权限点 | 典型动作 |
 |---|---|---|---|---|
-| `admin` 数仓负责人 | `admin@dagpilot.io` | 全部 | `job:write` `dep:write` `dag:validate` `run:simulate` `sla:write` `backfill:read` `alert:ack` `export:read` `audit:read` | 改作业分位时长、导入依赖、调 SLA 截止与缓冲 |
-| `operator` 值班工程师 | `operator@dagpilot.io` | 线路图 / 模拟运行 / 回填窗口 / 值班台 | `dag:validate` `run:simulate` `backfill:read` `alert:ack` `export:read` | 跑模拟、看关键路径、生成补数建议、确认告警 |
-| `viewer` 业务方（只读） | `viewer@dagpilot.io` | 值班台 / 线路图只读 | `estimate:read` | 看「几点能出数」，不能跑模拟 / 不能补数 / 不能改依赖 |
+| `admin` 数仓负责人 | `admin@dagpilot.io` | 全部 | `job:write` `dep:write` `dag:validate` `run:simulate` `sla:write` `backfill:read` `alert:ack` `export:read` `audit:read` `check:read` `check:run` `check:publish` | 改作业分位时长、导入依赖、调 SLA 截止与缓冲、发布体检结论 |
+| `operator` 值班工程师 | `operator@dagpilot.io` | 线路图 / 模拟运行 / 回填窗口 / 依赖体检 / 值班台 | `dag:validate` `run:simulate` `backfill:read` `alert:ack` `export:read` `check:read` `check:run` | 跑模拟、看关键路径、生成补数建议、发起依赖体检、确认告警 |
+| `viewer` 业务方（只读） | `viewer@dagpilot.io` | 值班台 / 依赖体检（只读） | `estimate:read` `check:read` | 看「几点能出数」、读回已发布的体检结论；不能跑模拟 / 不能补数 / 不能改依赖 |
 
 密码统一 `Demo@2026`。低权角色调高权接口由服务端返回 **403**（不是前端藏按钮）：
-`viewer` 调 `POST /api/simulations`、`POST /api/sla/backfill-suggestion`、`POST /api/dependencies/import` 全部 403；
-`operator` 调 `POST /api/jobs`、`PATCH /api/sla/policies/{id}` 也是 403。
+`viewer` 调 `POST /api/simulations`、`POST /api/sla/backfill-suggestion`、`POST /api/dependencies/import`、`POST /api/dep-checks` 全部 403；
+`operator` 调 `POST /api/jobs`、`PATCH /api/sla/policies/{id}`、`POST /api/dep-checks/{id}/publish` 也是 403。
 
 ## 一天的工作剧本（2026-11-12）
 
@@ -45,14 +45,15 @@
 | 08:00 | 沈岸（admin） | 把报表线 SLA 缓冲从 30 提到 35 分钟 | `PATCH /api/sla/policies/1` |
 | 09:10 | 沈岸 | 导入依赖（补一条 `ads_store_daily → ads_report_export`） | 先试算校验 0 环，再合并导入 |
 
-## 主要功能（4 个业务模块串成链路）
+## 主要功能（5 个业务模块串成链路）
 
 1. **作业 / 依赖维护**（`/jobs`）：站表（作业清单）、SVG 自绘分层线路图、依赖边列表、导入依赖（试算校验 → 合并）、校验（Kahn 拓扑 + 环检测）。
 2. **校验**：返回拓扑序、分层、环路径、P50/P90 链路时长与峰值并发。
 3. **运行模拟**（`/simulate`）：按 P50 / P90 两套分位重排整条链路，输出关键路径链、逐作业 ES/EF/LS/LF 与总浮时、时序条、并发带、SLA 判定；结果落库可复现。
 4. **回填建议**（`/sla`）：latest_start / 可用窗口 / 可回填天数 / 剩余松弛 / 集群峰值并发 / 逐天补数排期。
-5. **导出**：排期 CSV、回填计划 CSV。
-6. **值班台**（`/watch`）：由 SLA 快照 + 历史批次派生的等待/告警列表（含确认），链路就绪看板。
+5. **依赖体检**（`/dep-check`）：按链路 + 业务日期整理原始调度记录（重试/迟到/旧版本归并），对每条声明依赖给出 有效 / 长期违背 / 证据不足 / 待核 结论，为无声明路径却稳定前后相接的作业对列出补边候选与反例；结论先存草稿，审核后整批发布。
+6. **导出**：排期 CSV、回填计划 CSV。
+7. **值班台**（`/watch`）：由 SLA 快照 + 历史批次派生的等待/告警列表（含确认），链路就绪看板。
 
 ## 两个真算算法
 
@@ -95,6 +96,44 @@ window        = 次日 latest_start − as_of
 **可复现**：报表线 → `latest_start = 06:30 − 5h48m − 0:30 = 00:12`；
 as_of = 2026-11-12T08:00 → 窗口 16h12m（972 分钟）→ 可补 `floor(972/348) = 2` 天，剩余松弛 276 分钟（4h36m）；
 集群峰值并发 7，峰值时刻 01:34。
+
+### 算法 3 · 依赖体检（`backend/src/services/run_fact_service.py` + `dep_check_service.py`）
+
+**第一步 · 运行明细整理**（按 链路 + 业务日期 + 作业 归并原始调度记录）：
+
+```
+同一 (作业, 业务日期) 的多次上报：
+  同 attempt 多版本     → 最高版本有效，其余拒绝「旧版本记录」
+  同 attempt 同版本多条  → 时间不一致即「最终记录冲突」，整组作废
+  跨 attempt            → 最大 attempt 有效，其余拒绝「被重试取代」
+  有效记录 end < start   → 「时间倒挂」，整组作废（时间证据冲突）
+  入库时间 − 结束 > 6h   → 标记「迟到记录」（仍有效，但页面上点名）
+```
+
+**第二步 · 逐边结论**（阈值集中在 `constants/limits.py`，回看 30 个业务日期）：
+
+```
+冲突日期占比 > 20%        → 待核（时间证据冲突，不下结论）
+可配对样本 < 5 天          → 待核（样本不足，不下结论）
+遵守率 ≥ 90%              → 有效        遵守 = 下游起跑 ≥ 上游结束 + lag
+违背率 ≥ 50%              → 长期违背
+两者之间                  → 证据不足（遵守与违背混杂）
+```
+
+**第三步 · 补边候选**：同一链路、声明图中双向不可达的作业对，
+`下游起跑 − 上游结束 ∈ [0, 10] 分钟` 的天数占比 ≥ 80% → 建议补边（附逐日反例）；
+样本不足 / 冲突超限的对保留为待核，不直接下结论。
+
+**批次生命周期**：草稿 → 审核 → 整批发布（事务，失败回滚保留旧版）。
+指纹 = sha256(原始记录 + 依赖边 + 作业状态 + 算法版本)：
+同一批重复发起复用旧草稿不新增版本；上游记录变化后旧结论标记失效，需重新体检；
+发布时指纹过期直接 409 拒绝。
+
+**可复现**（seed 剧本，29 项测试锁定）：38 条声明边 → 有效 31 / 长期违背 1
+（`ads_report_stage → ads_store_daily`，七成天数 01:25 抢跑）/ 证据不足 1
+（`feature_label_join → feature_publish_hive`，遵守率 70%）/ 待核 5
+（`feature_store_profile` 仅 3 天样本 × 2 边 + `dim_channel_map` 冲突 9 天 × 3 边）；
+补边候选 1（`dws_trade_minute → dqc_trade_rules`，30 天里 25 天前后相接，反例 5 天）。
 
 ## 快速启动
 
@@ -143,7 +182,8 @@ cd frontend && npm install && npm run dev     # 5173，/api 代理到 19244
 backend/
   src/{config,constants,models,schemas,services,controllers,routes,middlewares,utils}/
   scripts/{seed_demo.py,demo_config.py,worker_healthcheck.sh}
-  migrations/0001_initial.sql
+  migrations/{0001_initial.sql,0002_dep_check.sql}
+  tests/{test_dep_check.py,test_dep_check_seed.py,test_dep_check_api.py,test_dep_check_e2e.py}
 frontend/
   src/{api,stores,types,components/common,components/layout,hooks,pages,router,utils,constants,styles}/
 docker-compose.yml  .env.example
@@ -172,6 +212,9 @@ docker-compose.yml  .env.example
 | 运行状态 `RunStatus` | `backend/src/constants/enums.py` | `frontend/src/constants/enums.ts` |
 | 分位口径 `RunMode` | `backend/src/constants/enums.py` | `frontend/src/constants/enums.ts` · `types/models.ts` |
 | 风险档位 `RiskLevel` | `backend/src/constants/enums.py` | `frontend/src/constants/enums.ts` |
+| 体检结论 `CheckVerdict` | `backend/src/constants/enums.py` | `frontend/src/constants/enums.ts` · `types/models.ts` |
+| 记录拒绝原因 `RejectReason` | `backend/src/constants/enums.py` | `frontend/src/constants/enums.ts` |
+| 体检批次状态 `CheckBatchStatus` | `backend/src/constants/enums.py` | `frontend/src/constants/enums.ts` · `types/models.ts` |
 
 ## Docker 说明
 
